@@ -29,7 +29,7 @@ from utils.visualize import (
 
 
 def run(image_path: str, n_keypoints: int = 20, wm_bits: int = 64,
-        output_dir: str = "output"):
+        output_dir: str = "output", dump_sift_steps: bool = False):
 
     out = Path(output_dir)
     out.mkdir(exist_ok=True)
@@ -44,6 +44,14 @@ def run(image_path: str, n_keypoints: int = 20, wm_bits: int = 64,
     rng = np.random.default_rng(seed=42)
     watermark = rng.integers(0, 2, wm_bits, dtype=np.uint8)
     print(f"[2] Watermark ({wm_bits} bits): {watermark}")
+
+    if dump_sift_steps:
+        from src.sift_utils import export_sift_debug_artifacts
+        dbg = export_sift_debug_artifacts(img, str(out), n_keypoints)
+        print(
+            f"[2.5] SIFT debug exported -> {dbg['output_dir']} "
+            f"(selected={dbg['num_selected']}, raw_oriented={dbg['num_raw_oriented']})"
+        )
 
     # ── 3. Detect keypoints + visualize ───────────────────────────────────
     from src.sift_utils import detect_keypoints
@@ -178,6 +186,8 @@ if __name__ == "__main__":
                         help="Watermark length in bits")
     parser.add_argument("--output_dir",  default="output",
                         help="Output directory")
+    parser.add_argument("--dump_sift_steps", action="store_true",
+                        help="Export intermediate SIFT step images + README.md")
     args = parser.parse_args()
 
-    run(args.image, args.n_keypoints, args.wm_bits, args.output_dir)
+    run(args.image, args.n_keypoints, args.wm_bits, args.output_dir, args.dump_sift_steps)

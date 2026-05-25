@@ -26,6 +26,7 @@ detect_keypoints implements the full SIFT detection pipeline from scratch:
 import cv2
 import numpy as np
 import pickle
+from pathlib import Path
 
 
 PATCH_SIZE   = 32    # pixels per side of the canonical patch
@@ -519,3 +520,165 @@ def load_keypoints(path: str) -> list[cv2.KeyPoint]:
                      response=response, octave=octave, class_id=class_id)
         for pt, size, angle, response, octave, class_id in data
     ]
+
+
+def _to_u8(img: np.ndarray) -> np.ndarray:
+    """Convert arbitrary float/int image to uint8 for visualization."""
+    img = img.astype(np.float32)
+    mn, mx = float(img.min()), float(img.max())
+    if mx - mn < 1e-12:
+        return np.zeros_like(img, dtype=np.uint8)
+    out = (img - mn) * (255.0 / (mx - mn))
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def export_sift_debug_artifacts(
+    img: np.ndarray,
+    output_dir: str,
+    n_keypoints: int = 20,
+) -> dict:
+    """
+    Export intermediate SIFT step images and a markdown description.
+
+    Outputs are written to:
+      <output_dir>/sift_debug/
+        - step*.png
+        - README.md
+    """
+    gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray01 = gray.astype(np.float32) / 255.0
+
+    dbg_dir = Path(output_dir) / "sift_debug"
+    dbg_dir.mkdir(parents=True, exist_ok=True)
+
+    cv2.imwrite(str(dbg_dir / "step0_input_gray.png"), gray)
+
+    gaussians, dogs, factors, sigmas_oct = _sift_build_scale_space(gray01)
+    S = _SIFT_N_SCALES
+    raw_thresh = 0.5 * _SIFT_CONTRAST_THRESH / S
+
+    report_lines = [
+        "# SIFT Debug Artifacts",
+        "",
+        "This folder contains intermediate outputs of the custom SIFT pipeline.",
+        "",
+        "## Step 0 - Input",
+        "- `step0_input_gray.png`: original grayscale image used for SIFT.",
+        "",
+    ]
+
+    # Step 1: Gaussian / DoG pyramids
+    report_lines += ["## Step 1 - Scale-Space (Gaussian + DoG)"]
+    for o, (g_oct, d_oct) in enumerate(zip(gaussians, dogs)):
+        for s, g_img in enumerate(g_oct):
+            g_name = f"step1_oct{o}_gaussian_s{s}.png"
+            cv2.imwrite(str(dbg_dir / g_name), _to_u8(g_img))
+            report_lines.append(f"- `{g_name}`: Gaussian octave {o}, scale {s}.")
+        for s, d_img in enumerate(d_oct):
+            d_name = f"step1_oct{o}_dog_s{s}.png"
+            cv2.imwrite(str(dbg_dir / d_name), _to_u8(d_img))
+            report_lines.append(f"- `{d_name}`: DoG octave {o}, scale {s}.")
+    report_lines.append("")
+
+    # Steps 2-4: extrema, refinement, orientation
+    raw_kps: list[cv2.KeyPoint] = []
+    report_lines += ["## Step 2/3/4 - Extrema, Refinement, Orientation"]
+
+    for o, (gaussians_oct, dogs_oct, factor, sigs) in enumerate(
+        zip(gaussians, dogs, factors, sigmas_oct)
+    ):
+        raw_pts_orig: list[tuple[int, int]] = []
+        refined_pts_orig: list[tuple[int, int]] = []
+        candidates = []
+
+        for s in range(1, S + 1):
+            d_prev = dogs_oct[s - 1]
+            d_curr = dogs_oct[s]
+            d_next = dogs_oct[s + 1]
+
+            mask = np.abs(d_curr[1:-1, 1:-1]) > raw_thresh
+            ys, xs = np.nonzero(mask)
+            for yr, xr in zip(ys, xs):
+                y, x = yr + 1, xr + 1
+                val = d_curr[y, x]
+
+                cube = np.array(
+                    [
+                        d_prev[y - 1:y + 2, x - 1:x + 2],
+                        d_curr[y - 1:y + 2, x - 1:x + 2],
+                        d_next[y - 1:y + 2, x - 1:x + 2],
+                    ]
+                )
+                rest = np.concatenate([cube.ravel()[:13], cube.ravel()[14:]])
+                if not (val > rest.max() or val < rest.min()):
+                    continue
+
+                raw_pts_orig.append((int(round(x * factor)), int(round(y * factor))))
+                refined = _sift_refine_extremum(dogs_oct, s, y, x)
+                if refined is not None:
+                    candidates.append(refined)
+                    refined_pts_orig.append(
+                        (int(round(refined[2] * factor)), int(round(refined[1] * factor)))
+                    )
+
+        vis = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        for x, y in raw_pts_orig:
+            if 0 <= x < vis.shape[1] and 0 <= y < vis.shape[0]:
+                cv2.circle(vis, (x, y), 1, (0, 255, 255), -1)  # yellow
+        for x, y in refined_pts_orig:
+            if 0 <= x < vis.shape[1] and 0 <= y < vis.shape[0]:
+                cv2.circle(vis, (x, y), 2, (0, 255, 0), 1)     # green
+
+        extrema_name = f"step2_oct{o}_raw_vs_refined.png"
+        cv2.imwrite(str(dbg_dir / extrema_name), vis)
+
+        kps_oct = _sift_assign_orientations(gaussians_oct, candidates, factor, sigs)
+        raw_kps.extend(kps_oct)
+        report_lines.append(
+            f"- `{extrema_name}`: octave {o}; yellow=raw extrema, green=refined extrema. "
+            f"raw={len(raw_pts_orig)}, refined={len(refined_pts_orig)}, oriented={len(kps_oct)}."
+        )
+
+    report_lines.append("")
+
+    # Step 5: final selection
+    raw_kps.sort(key=lambda kp: kp.response, reverse=True)
+    h_img, w_img = gray.shape
+    selected: list[cv2.KeyPoint] = []
+    for kp in raw_kps:
+        x, y = kp.pt
+        sigma = kp.size / 2.0
+        src_r = sigma * SCALE_FACTOR + 2
+        if x - src_r < 0 or x + src_r >= w_img or y - src_r < 0 or y + src_r >= h_img:
+            continue
+        if any(np.hypot(x - s.pt[0], y - s.pt[1]) < MIN_KP_DIST for s in selected):
+            continue
+        selected.append(kp)
+        if len(selected) >= n_keypoints:
+            break
+
+    vis_final = cv2.drawKeypoints(
+        gray,
+        selected,
+        None,
+        color=(0, 255, 0),
+        flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS,
+    )
+    cv2.imwrite(str(dbg_dir / "step5_final_keypoints.png"), vis_final)
+
+    report_lines += [
+        "## Step 5 - Final Keypoint Selection",
+        f"- `step5_final_keypoints.png`: selected keypoints after response sort + boundary + spacing filter.",
+        "",
+        "## Summary",
+        f"- Raw oriented keypoints before final filtering: {len(raw_kps)}",
+        f"- Final selected keypoints: {len(selected)} (requested {n_keypoints})",
+        "",
+    ]
+
+    (dbg_dir / "README.md").write_text("\n".join(report_lines), encoding="utf-8")
+    return {
+        "output_dir": str(dbg_dir),
+        "num_raw_oriented": len(raw_kps),
+        "num_selected": len(selected),
+    }
