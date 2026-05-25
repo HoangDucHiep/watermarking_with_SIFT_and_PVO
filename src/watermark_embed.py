@@ -1,15 +1,19 @@
 """
-Watermark embedding pipeline.
+Watermark embedding pipeline — SIFT (cv2) + IPVO.
+
+Both detection and descriptor computation use cv2.SIFT at embed time,
+ensuring consistency with cv2.SIFT used at extract time.
 
 Steps:
-  1. Detect N stable SIFT keypoints in the host image
-  2. For each keypoint: extract canonical patch → embed watermark via IPVO
-  3. Write modified patch back into image
-  4. Save keypoints + location maps to a sidecar file
+  1. Detect N stable SIFT keypoints using cv2.SIFT
+  2. Select top-N non-overlapping keypoints by response
+  3. For each keypoint: extract canonical patch → embed watermark via IPVO
+  4. Write modified patch back into image
+  5. Save keypoints + descriptors + location maps to a sidecar file
 
 Outputs:
   - watermarked image (uint8 ndarray)
-  - embed_data dict (keypoints, location_maps, watermark, patch_size)
+  - embed_data dict (keypoints, descriptors, location_maps, watermark, patch_size)
 """
 
 import cv2
@@ -17,7 +21,13 @@ import numpy as np
 import pickle
 from pathlib import Path
 
-from src.sift_utils import detect_keypoints, extract_canonical_patch, put_canonical_patch, PATCH_SIZE
+from src.sift_utils import (
+    extract_canonical_patch,
+    put_canonical_patch,
+    PATCH_SIZE,
+    SCALE_FACTOR,
+    MIN_KP_DIST,
+)
 from src import pvo
 
 
@@ -27,7 +37,10 @@ def embed_watermark(
     n_keypoints: int = 20,
 ) -> tuple[np.ndarray, dict]:
     """
-    Embed a binary watermark into the image using SIFT + IPVO.
+    Embed a binary watermark into the image using cv2.SIFT + IPVO.
+
+    Both detection and descriptor computation use cv2.SIFT, ensuring
+    descriptor consistency between embed and extract pipelines.
 
     Args:
         img:         Grayscale uint8 image
@@ -38,7 +51,8 @@ def embed_watermark(
         (watermarked_img, embed_data)
 
         embed_data keys:
-          'keypoints'     – list of cv2.KeyPoint
+          'keypoints'     – list of cv2.KeyPoint (from cv2.SIFT)
+          'descriptors'   – ndarray (n, 128), float32, from cv2.SIFT
           'location_maps' – list of location maps, one per keypoint
           'watermark'     – original watermark bits
           'patch_size'    – PATCH_SIZE constant
@@ -50,19 +64,54 @@ def embed_watermark(
         f"Watermark length {len(watermark)} exceeds patch capacity {capacity}"
     )
 
-    keypoints = detect_keypoints(img, n_keypoints)
-    if not keypoints:
-        raise RuntimeError("No stable SIFT keypoints found in image")
+    # ── Detect keypoints using cv2 SIFT ─────────────────────────────────────────
+    sift = cv2.SIFT_create(nfeatures=0, contrastThreshold=0.04, edgeThreshold=10)
+    _raw, all_descs = sift.detectAndCompute(img, None)
+    # Ensure keypoints are a list (not tuple) so we can sort in-place
+    raw_kps: list = list(_raw) if _raw is not None else []
 
-    # Compute SIFT descriptors for original keypoints (used for matching at extraction)
-    sift = cv2.SIFT_create()
-    _, descriptors = sift.compute(img, keypoints)   # shape (n, 128)
+    if not raw_kps or all_descs is None:
+        raise RuntimeError("cv2.SIFT found no keypoints in image")
 
+    # Save original indices before sorting (descriptors[i] corresponds to raw_kps[i])
+    for i, kp in enumerate(raw_kps):
+        kp.class_id = i
+
+    # ── Select top-N non-overlapping keypoints ──────────────────────────────────
+    # Sort by response (strength) descending
+    raw_kps.sort(key=lambda kp: kp.response, reverse=True)
+
+    h_img, w_img = img.shape[:2]
+    selected: list[cv2.KeyPoint] = []
+
+    for kp in raw_kps:
+        x, y = kp.pt
+        sigma = kp.size / 2.0
+        src_r = sigma * SCALE_FACTOR + 2
+
+        # Patch must fit entirely inside the image
+        if x - src_r < 0 or x + src_r >= w_img or y - src_r < 0 or y + src_r >= h_img:
+            continue
+
+        # Must be at least MIN_KP_DIST away from already-selected keypoints
+        if any(np.hypot(x - s.pt[0], y - s.pt[1]) < MIN_KP_DIST for s in selected):
+            continue
+
+        selected.append(kp)
+        if len(selected) >= n_keypoints:
+            break
+
+    if not selected:
+        raise RuntimeError(
+            f"No stable keypoints found after filtering (requested {n_keypoints})"
+        )
+
+    # ── Embed watermark into each selected keypoint's canonical patch ────────────
     img_out = img.copy()
     location_maps = []
     n_embedded_list = []
 
-    for kp in keypoints:
+    for kp in selected:
         patch = extract_canonical_patch(img, kp)
         if patch is None:
             location_maps.append(None)
@@ -72,12 +121,15 @@ def embed_watermark(
         modified_patch, loc_map, n_emb = pvo.embed(patch, watermark)
         location_maps.append(loc_map)
         n_embedded_list.append(n_emb)
-
         img_out = put_canonical_patch(img_out, kp, modified_patch)
 
+    # Extract descriptors for the selected keypoints using saved original indices
+    selected_indices = [kp.class_id for kp in selected]
+    selected_descs = all_descs[selected_indices]
+
     embed_data = {
-        'keypoints':     keypoints,
-        'descriptors':   descriptors,        # float32 (n, 128)
+        'keypoints':     selected,
+        'descriptors':   selected_descs,   # (n_selected, 128), float32
         'location_maps': location_maps,
         'watermark':     watermark.copy(),
         'patch_size':    PATCH_SIZE,
