@@ -359,3 +359,245 @@ def draw_comparison_table(
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Watermark debug / visualization helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _bit_heatmap(patch_size: int, location_map: list[tuple[int, int]],
+                 bits: np.ndarray) -> np.ndarray:
+    """
+    For each 3×3 block, record the embedded bit value (0, 1) or 2 (shift/skip).
+
+    Returns a float32 image (patch_size × patch_size) where each 3×3 block
+    cell is filled with the bit value * 85 (so 0→0, 1→85, 2→170).
+    """
+    out = np.full((patch_size, patch_size), 2.0, dtype=np.float32)
+    bit_idx = 0
+    for r in range(0, patch_size - 2, 3):
+        for c in range(0, patch_size - 2, 3):
+            loc_max, loc_min = location_map[bit_idx] if bit_idx < len(location_map) else (2, 2)
+            val = 2.0
+            consumed = False
+            for loc in (loc_max, loc_min):
+                if loc == 3:
+                    continue
+                if loc == 2:
+                    continue
+                if bit_idx < len(bits) and bits[bit_idx] in (0, 1):
+                    val = float(bits[bit_idx])
+                    bit_idx += 1
+                    consumed = True
+            if not consumed:
+                bit_idx += 1
+            out[r:r + 3, c:c + 3] = val * 85.0
+    return out
+
+
+def export_watermark_debug_artifacts(
+    img_original: np.ndarray,
+    img_watermarked: np.ndarray,
+    embed_data: dict,
+    output_dir: str,
+    n_samples: int = 4,
+) -> None:
+    """
+    Export visualisations showing how and where watermark bits were embedded.
+
+    Outputs (saved to <output_dir>/watermark_debug/):
+      wm1_diff_full.png     – full-image difference (watermarked − original), colormap
+      wm2_patch_grid.png    – for each selected patch: orig / watermarked / diff / bit-heatmap
+      wm3_loc_map.png       – location map grid for each selected patch
+      wm4_patch_comparison.png – row of original patches vs watermarked patches
+      README.md             – description of each file + stats per keypoint
+
+    Args:
+        img_original:    uint8 grayscale original image
+        img_watermarked: uint8 grayscale watermarked image
+        embed_data:     dict from embed_watermark()
+        output_dir:     base output directory
+        n_samples:       how many keypoint patches to visualise in detail (default 4)
+    """
+    from src.sift_utils import extract_canonical_patch
+
+    dbg = Path(output_dir) / "watermark_debug"
+    dbg.mkdir(parents=True, exist_ok=True)
+
+    keypoints = embed_data['keypoints']
+    loc_maps  = embed_data['location_maps']
+    n_embeds  = embed_data['n_embedded']
+    watermark = embed_data['watermark']
+    P         = embed_data['patch_size']
+
+    # ── 1. Full-image difference ─────────────────────────────────────────────
+    diff = cv2.absdiff(img_watermarked, img_original).astype(np.float32)
+    diff_u8 = (np.clip(diff / (diff.max() + 1e-12) * 255, 0, 255)
+               .astype(np.uint8))
+    diff_color = cv2.applyColorMap(diff_u8, cv2.COLORMAP_JET)
+    cv2.imwrite(str(dbg / "wm1_diff_full.png"), diff_color)
+
+    # ── 2. Per-patch grids (orig / watermarked / diff / bit heatmap) ────────
+    sample_kps = list(keypoints[:min(n_samples, len(keypoints))])
+    ncols = 4
+    nrows = len(sample_kps)
+
+    fig, axes = plt.subplots(nrows=nrows + 1, ncols=ncols,
+                             figsize=(ncols * 2.5, (nrows + 1) * 2.5))
+    for ax, title in zip(axes[0], ['Original patch', 'Watermarked patch',
+                                    'Difference |Δ|', 'Bit heatmap (0/1/shift)']):
+        ax.axis('off')
+        ax.set_title(title, fontsize=9, pad=4)
+
+    for row_idx, kp in enumerate(sample_kps):
+        kp_idx   = keypoints.index(kp)
+        patch_orig = extract_canonical_patch(img_original, kp)
+        patch_wm   = extract_canonical_patch(img_watermarked, kp)
+        loc_map    = loc_maps[kp_idx]
+
+        if patch_orig is None or patch_wm is None:
+            for col in range(ncols):
+                axes[row_idx + 1][col].axis('off')
+            continue
+
+        diff_patch = np.abs(
+            patch_wm.astype(np.int16) - patch_orig.astype(np.int16)
+        ).astype(np.uint8)
+
+        bit_hm = (_bit_heatmap(P, loc_map, watermark)
+                  if loc_map else np.full((P, P), 170.0))
+
+        axes[row_idx + 1][0].imshow(patch_orig, cmap='gray')
+        axes[row_idx + 1][0].axis('off')
+
+        axes[row_idx + 1][1].imshow(patch_wm, cmap='gray')
+        axes[row_idx + 1][1].axis('off')
+
+        axes[row_idx + 1][2].imshow(diff_patch, cmap='hot')
+        axes[row_idx + 1][2].axis('off')
+
+        hm = axes[row_idx + 1][3].imshow(bit_hm, cmap='coolwarm', vmin=0, vmax=170)
+        axes[row_idx + 1][3].axis('off')
+        plt.colorbar(hm, ax=axes[row_idx + 1][3], fraction=0.046, pad=0.04,
+                     ticks=[0, 85, 170])
+        axes[row_idx + 1][3].set_title('bit=0 | bit=1 | shift', fontsize=7)
+
+    plt.suptitle('Watermark embedding per patch (IPVO)', fontsize=11, y=1.0)
+    plt.tight_layout()
+    plt.savefig(str(dbg / "wm2_patch_grid.png"), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # ── 3. Location-map grid (colour-coded per block) ───────────────────────
+    nloc = len(sample_kps)
+    fig2, axes2 = plt.subplots(1, nloc, figsize=(nloc * 2.5, 2.5))
+    if nloc == 1:
+        axes2 = [axes2]
+
+    for ax, kp in zip(axes2, sample_kps):
+        kp_idx  = keypoints.index(kp)
+        loc_map = loc_maps[kp_idx]
+        n_emb   = n_embeds[kp_idx]
+
+        grid = np.zeros((P // 3, P // 3), dtype=np.float32)
+        bit_idx = 0
+        for r in range(P // 3):
+            for c in range(P // 3):
+                if bit_idx >= len(loc_map):
+                    break
+                loc_max, loc_min = loc_map[bit_idx]
+                # 0=skip, 1=shift, 2=bit0, 3=bit1
+                code = 0
+                for loc, b_idx in ((loc_max, bit_idx), (loc_min, bit_idx + 1)):
+                    if loc == 3:
+                        continue
+                    if loc == 2:
+                        code = max(code, 1)
+                    else:
+                        if b_idx < len(watermark):
+                            code = 3 if watermark[b_idx] == 1 else 2
+                grid[r, c] = code * (255.0 / 3.0)
+                bit_idx += 2
+
+        ax.imshow(grid, cmap='viridis', vmin=0, vmax=255)
+        ax.set_title(f'kp#{kp_idx+1}\n{n_emb}/{len(watermark)} bits', fontsize=8)
+        ax.axis('off')
+
+    cbar_ax = fig2.add_axes([0.92, 0.35, 0.015, 0.3])
+    norm = matplotlib.colors.Normalize(vmin=0, vmax=255)
+    cb = matplotlib.colorbar.ColorbarBase(
+        cbar_ax, cmap=plt.cm.viridis, norm=norm, orientation='vertical')
+    cb.set_ticks([255 * k / 3 for k in range(4)])
+    cb.set_ticklabels(['skip', 'shift', 'bit=0', 'bit=1'])
+    cb.ax.tick_params(labelsize=7)
+
+    plt.suptitle('Location Map per Patch (IPVO block decisions)', fontsize=10)
+    plt.tight_layout(rect=[0, 0, 0.91, 1])
+    plt.savefig(str(dbg / "wm3_loc_map.png"), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # ── 4. Big comparison: original patches vs watermarked patches ───────────
+    n_comp = min(n_samples, len(sample_kps))
+    fig3, axes3 = plt.subplots(2, n_comp, figsize=(n_comp * 2.5, 5))
+    if n_comp == 1:
+        axes3 = [axes3[0], axes3[1]]
+
+    for col_idx, kp in enumerate(sample_kps[:n_comp]):
+        patch_orig = extract_canonical_patch(img_original, kp)
+        patch_wm   = extract_canonical_patch(img_watermarked, kp)
+
+        axes3[0][col_idx].imshow(patch_orig, cmap='gray')
+        axes3[0][col_idx].set_title(f'kp#{col_idx+1} original', fontsize=8)
+        axes3[0][col_idx].axis('off')
+
+        axes3[1][col_idx].imshow(patch_wm, cmap='gray')
+        axes3[1][col_idx].set_title(f'kp#{col_idx+1} watermarked', fontsize=8)
+        axes3[1][col_idx].axis('off')
+
+    plt.suptitle('Patch Comparison: Original (top) vs Watermarked (bottom)', fontsize=10)
+    plt.tight_layout()
+    plt.savefig(str(dbg / "wm4_patch_comparison.png"), dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # ── 5. Summary markdown ──────────────────────────────────────────────────
+    summary_lines = [
+        "# Watermark Debug Artifacts",
+        "",
+        "This folder contains intermediate visualisations of the watermark embedding.",
+        "",
+        "## wm1_diff_full.png",
+        "Full-image difference: |watermarked − original|, colormap JET.",
+        "Brighter = larger pixel change. Shows WHERE in the image the watermark",
+        "was written (i.e. the canonical patches around SIFT keypoints).",
+        "",
+        "## wm2_patch_grid.png",
+        f"Top {n_samples} keypoint patches, 4 columns:",
+        "  - Column 1: original canonical patch",
+        "  - Column 2: watermarked canonical patch",
+        "  - Column 3: pixel difference |after − before| (hot colormap)",
+        "  - Column 4: bit heatmap: blue=bit0, red=bit1, gray=shift/skip",
+        "",
+        "## wm3_loc_map.png",
+        "Per-patch location map. Each 3×3 block = 1 cell. Colour encodes what",
+        "IPVO did: skip / shift / embedded bit=0 / embedded bit=1.",
+        "",
+        "## wm4_patch_comparison.png",
+        "Direct side-by-side original (top row) vs watermarked (bottom row) patches.",
+        "",
+        "## Per-keypoint stats",
+        f"- Total keypoints: {len(keypoints)}",
+        f"- Watermark length: {len(watermark)} bits",
+        f"- Watermark bits: {watermark.tolist()}",
+        "",
+        "| # | Position (x,y) | σ | θ (°) | Bits embedded | Loc map len |",
+        "|---|-----------------|-------|--------|---------------|-------------|",
+    ]
+    for i, (kp, lm, ne) in enumerate(zip(keypoints, loc_maps, n_embeds)):
+        if lm is not None:
+            summary_lines.append(
+                f"| {i+1} | ({kp.pt[0]:.1f}, {kp.pt[1]:.1f}) "
+                f"| {kp.size/2:.1f} | {kp.angle:.1f} "
+                f"| {ne}/{len(watermark)} "
+                f"| {len(lm)} |"
+            )
+
+    (dbg / "README.md").write_text("\n".join(summary_lines), encoding="utf-8")

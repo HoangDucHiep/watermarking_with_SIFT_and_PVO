@@ -25,11 +25,13 @@ from utils.visualize import (
     save_attacked_image,
     draw_metrics_table,
     draw_comparison_table,
+    export_watermark_debug_artifacts,
 )
 
 
 def run(image_path: str, n_keypoints: int = 20, wm_bits: int = 64,
-        output_dir: str = "output", dump_sift_steps: bool = False):
+        output_dir: str = "output", dump_sift_steps: bool = False,
+        dump_watermark_debug: bool = False):
 
     out = Path(output_dir)
     out.mkdir(exist_ok=True)
@@ -74,6 +76,11 @@ def run(image_path: str, n_keypoints: int = 20, wm_bits: int = 64,
     s = ssim(img, img_wm)
     print(f"[4] Watermark embedded -> PSNR={p:.2f} dB  SSIM={s:.4f}")
     print(f"    output/2_watermarked.png  output/3_embed_marked.png")
+
+    if dump_watermark_debug:
+        export_watermark_debug_artifacts(
+            img, img_wm, embed_data, str(out), n_samples=6)
+        print(f"    watermark debug -> output/watermark_debug/")
 
     # ── 5. Attack + Extract ────────────────────────────────────────────────
     results = []
@@ -188,6 +195,9 @@ if __name__ == "__main__":
                         help="Output directory")
     parser.add_argument("--dump_sift_steps", action="store_true",
                         help="Export intermediate SIFT step images + README.md")
+    parser.add_argument("--dump_watermark_debug", action="store_true",
+                        help="Export watermark embedding debug images (diff, bit heatmap, loc map)")
     args = parser.parse_args()
 
-    run(args.image, args.n_keypoints, args.wm_bits, args.output_dir, args.dump_sift_steps)
+    run(args.image, args.n_keypoints, args.wm_bits, args.output_dir,
+        args.dump_sift_steps, args.dump_watermark_debug)
