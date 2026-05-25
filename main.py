@@ -1,9 +1,10 @@
 """
-main.py — CLI runner for SIFT + IPVO watermarking demo.
+main.py — CLI runner for SIFT+IPVO và SIFT+SS watermarking demo.
 
 Usage:
     python main.py
     python main.py --image data/gray/7.1.01.tiff --n_keypoints 15
+    python main.py --no-ss     # bỏ qua Spread Spectrum pipeline
 
 All outputs are saved to the output/ folder.
 """
@@ -15,6 +16,8 @@ from pathlib import Path
 
 from src.watermark_embed    import embed_watermark, save_embed_data
 from src.watermark_extract  import extract_watermark
+from src.watermark_embed_ss import embed_watermark_ss
+from src.watermark_extract_ss import extract_watermark_ss
 from src.watermark_baseline import embed_baseline, extract_baseline, grid_patch_keypoints, PATCH_SIZE
 from utils.attacks  import run_all_attacks, ATTACK_SUITE
 from utils.metrics  import evaluate_all, psnr, ssim
@@ -31,7 +34,7 @@ from utils.visualize import (
 
 def run(image_path: str, n_keypoints: int = 20, wm_bits: int = 64,
         output_dir: str = "output", dump_sift_steps: bool = False,
-        dump_watermark_debug: bool = False):
+        dump_watermark_debug: bool = False, run_ss: bool = True):
 
     out = Path(output_dir)
     out.mkdir(exist_ok=True)
@@ -174,12 +177,46 @@ def run(image_path: str, n_keypoints: int = 20, wm_bits: int = 64,
         baseline_results.append(metrics_bl)
         print(f"  [{attack_name:20s}]  BER={metrics_bl['BER']:.4f}  NC={metrics_bl['NC']:.4f}")
 
-    # ── 8. Comparison table ────────────────────────────────────────────────
+    # ── 8. Comparison table: IPVO vs Baseline ─────────────────────────────
     draw_comparison_table(
         results, baseline_results,
         save_path=str(out / "8_comparison_table.png"),
     )
-    print(f"\n[8] Comparison table -> output/8_comparison_table.png")
+    print(f"\n[8] Comparison table (IPVO vs Baseline) -> output/8_comparison_table.png")
+
+    # ── 9. SIFT + Spread Spectrum pipeline ────────────────────────────────
+    ss_results = []
+    if run_ss:
+        print("\n--- SIFT + Spread Spectrum (SS) ---")
+        img_ss, embed_ss_data = embed_watermark_ss(img, watermark, n_keypoints)
+        p_ss = psnr(img, img_ss)
+        s_ss = ssim(img, img_ss)
+        print(f"    PSNR={p_ss:.2f} dB  SSIM={s_ss:.4f}")
+        print(f"    output/9_ss_watermarked.png")
+
+        cv2.imwrite(str(out / "9_ss_watermarked.png"), img_ss)
+
+        for attack_name, img_attacked_ss in run_all_attacks(img_ss):
+            wm_ext_ss, surv_ss, lost_ss, nloc_ss = extract_watermark_ss(
+                img_attacked_ss, embed_ss_data)
+            m_ss = evaluate_all(img, img_attacked_ss, watermark, wm_ext_ss)
+            m_ss['attack']   = attack_name
+            m_ss['survived'] = f"{len(surv_ss)}/{len(embed_ss_data['keypoints'])}"
+            ss_results.append(m_ss)
+            print(f"  [{attack_name:20s}]  BER={m_ss['BER']:.4f}  "
+                  f"NC={m_ss['NC']:.4f}  survived={m_ss['survived']}")
+
+        draw_metrics_table(ss_results,
+                           save_path=str(out / "9_ss_metrics_table.png"))
+        print(f"\n[9] SS Metrics table -> output/9_ss_metrics_table.png")
+
+        # ── 10. Comparison table: SS vs Baseline ──────────────────────────
+        draw_comparison_table(
+            ss_results, baseline_results,
+            save_path=str(out / "10_ss_vs_baseline_table.png"),
+        )
+        print(f"[10] Comparison table (SS vs Baseline) -> output/10_ss_vs_baseline_table.png")
+
     print("\nDone! All outputs saved to output/")
 
 
@@ -197,7 +234,10 @@ if __name__ == "__main__":
                         help="Export intermediate SIFT step images + README.md")
     parser.add_argument("--dump_watermark_debug", action="store_true",
                         help="Export watermark embedding debug images (diff, bit heatmap, loc map)")
+    parser.add_argument("--no-ss", action="store_true",
+                        help="Bỏ qua pipeline SIFT+Spread Spectrum")
     args = parser.parse_args()
 
     run(args.image, args.n_keypoints, args.wm_bits, args.output_dir,
-        args.dump_sift_steps, args.dump_watermark_debug)
+        args.dump_sift_steps, args.dump_watermark_debug,
+        run_ss=not args.no_ss)

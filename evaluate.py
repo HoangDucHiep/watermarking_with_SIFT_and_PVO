@@ -57,13 +57,17 @@ def run_one_image(
     img_name: str,
     img: np.ndarray,
     attack_names: list[str],
-    attacks: list,
+    attacks_fn: list,
     run_baseline: bool,
     n_keypoints: int,
     wm_bits: int,
 ) -> dict:
     """
     Run the full pipeline (SIFT+IPVO + optionally Baseline) for one image.
+
+    NOTE: attacks_fn is a list of attack callables (not pre-computed images).
+    Attacks are applied AFTER embedding so that extraction operates on the
+    correct (watermarked + attacked) image.
 
     Returns:
         dict with keys 'sift', 'baseline', 'psnr', 'ssim', 'n_kps', 'elapsed_ms'
@@ -85,7 +89,9 @@ def run_one_image(
             'error': str(e),
         }
 
-    for (atk_name, img_attacked) in zip(attack_names, attacks):
+    # Attack the WATERMARKED image (img_wm), not the original!
+    for atk_name, atk_fn in zip(attack_names, attacks_fn):
+        img_attacked = atk_fn(img_wm.copy())
         wm_ext, surviving_kps, lost_idx, n_located = extract_watermark(
             img_attacked, embed_data)
         m = evaluate_all(img, img_attacked, watermark, wm_ext)
@@ -110,9 +116,11 @@ def run_one_image(
                 'error': str(e),
             }
 
-        for (atk_name, img_attacked) in zip(attack_names, attacks):
-            wm_ext_bl = extract_baseline(img_attacked, embed_bl)
-            m = evaluate_all(img, img_attacked, watermark, wm_ext_bl)
+        # Attack the BASELINE WATERMARKED image (img_bl), not the original!
+        for atk_name, atk_fn in zip(attack_names, attacks_fn):
+            img_attacked_bl = atk_fn(img_bl.copy())
+            wm_ext_bl = extract_baseline(img_attacked_bl, embed_bl)
+            m = evaluate_all(img, img_attacked_bl, watermark, wm_ext_bl)
             m['image']     = img_name
             m['attack']    = atk_name
             bl_rows.append(m)
@@ -348,12 +356,12 @@ def main():
             failed_images.append((img_name, 'load_failed'))
             continue
 
-        # Pre-compute attacked images (same for SIFT and Baseline)
-        attacked_imgs = [fn(img.copy()) for fn in attacks_fn]
-
+        # Pass attack callables — they are applied inside run_one_image
+        # on img_wm (SIFT) and img_bl (Baseline) respectively,
+        # NOT on the raw original image.
         result = run_one_image(
             img_name, img,
-            attack_names, attacked_imgs,
+            attack_names, attacks_fn,
             run_baseline=not args.no_baseline,
             n_keypoints=args.n_keypoints,
             wm_bits=args.wm_bits,
