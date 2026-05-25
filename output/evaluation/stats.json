@@ -1,0 +1,24 @@
+{
+  "SIFT+IPVO": {
+    "rotate_15": {
+      "PSNR_mean": 11.6233,
+      "SSIM_mean": 0.0357,
+      "BER_mean": 0.5833,
+      "NC_mean": -0.1667,
+      "PSNR_std": 2.575,
+      "SSIM_std": 0.0131,
+      "BER_std": 0.0361,
+      "NC_std": 0.0722
+    },
+    "scale_0.75": {
+      "PSNR_mean": 11.6518,
+      "SSIM_mean": 0.0418,
+      "BER_mean": 0.5833,
+      "NC_mean": -0.1667,
+      "PSNR_std": 2.3898,
+      "SSIM_std": 0.0089,
+      "BER_std": 0.0361,
+      "NC_std": 0.0722
+    }
+  }
+}
